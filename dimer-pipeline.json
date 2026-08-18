@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "taskType": "tabular_regression",
+  "datasetPreprocessing": {
+    "target_column": {
+      "type": "string",
+      "kind": "length",
+      "description": "Name of the finite numeric target column.",
+      "minLength": 1,
+      "maxLength": 128,
+      "default": "target"
+    },
+    "drop_columns": {
+      "type": "string",
+      "kind": "length",
+      "description": "Comma-separated columns to exclude from features.",
+      "minLength": 0,
+      "maxLength": 512,
+      "default": ""
+    },
+    "max_train_rows": {
+      "type": "integer",
+      "kind": "range",
+      "description": "Maximum training rows retained by DIMER before TabICL fine-tuning. TabICL internally chunks meta-datasets.",
+      "minimum": 100,
+      "maximum": 50000,
+      "default": 10000
+    },
+    "validation_split": {
+      "type": "number",
+      "kind": "range",
+      "description": "Holdout fraction when val.csv is absent.",
+      "minimum": 0.05,
+      "maximum": 0.4,
+      "default": 0.2
+    }
+  },
+  "modelFinetuning": {
+    "epochs": {
+      "type": "integer",
+      "kind": "range",
+      "description": "Fine-tuning epochs.",
+      "minimum": 1,
+      "maximum": 100,
+      "default": 30
+    },
+    "learning_rate": {
+      "type": "number",
+      "kind": "range",
+      "description": "AdamW learning rate.",
+      "minimum": 0.0000001,
+      "maximum": 0.001,
+      "default": 0.00001
+    },
+    "weight_decay": {
+      "type": "number",
+      "kind": "range",
+      "description": "AdamW weight decay.",
+      "minimum": 0.0,
+      "maximum": 0.2,
+      "default": 0.01
+    },
+    "patience": {
+      "type": "integer",
+      "kind": "range",
+      "description": "Early-stopping patience in epochs.",
+      "minimum": 1,
+      "maximum": 30,
+      "default": 8
+    },
+    "time_limit_seconds": {
+      "type": "integer",
+      "kind": "range",
+      "description": "Wall-clock fine-tuning budget.",
+      "minimum": 60,
+      "maximum": 14400,
+      "default": 1800
+    },
+    "seed": {
+      "type": "integer",
+      "kind": "range",
+      "description": "Random seed.",
+      "minimum": 0,
+      "maximum": 2147483647,
+      "default": 0
+    },
+    "eval_metric": {
+      "type": "string",
+      "kind": "enum",
+      "description": "Validation metric driving best-checkpoint selection.",
+      "enum": ["mse", "mae", "r2"],
+      "default": "mae"
+    },
+    "n_estimators_finetune": {
+      "type": "integer",
+      "kind": "range",
+      "description": "Ensemble size during training meta-batches.",
+      "minimum": 1,
+      "maximum": 8,
+      "default": 2
+    },
+    "n_estimators_validation": {
+      "type": "integer",
+      "kind": "range",
+      "description": "Ensemble size during validation.",
+      "minimum": 1,
+      "maximum": 8,
+      "default": 2
+    },
+    "n_estimators_inference": {
+      "type": "integer",
+      "kind": "range",
+      "description": "Ensemble size used by the saved inference artifact.",
+      "minimum": 1,
+      "maximum": 32,
+      "default": 8
+    }
+  }
+}
