@@ -1,0 +1,17 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pandas==2.2.3 numpy==2.0.2 scikit-learn==1.6.1 requests==2.32.3 pyarrow==19.0.1 pytest
+      - run: python -m py_compile train.py
+      - run: python -m json.tool dimer-pipeline.json > /dev/null
+      - run: pytest -q
