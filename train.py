@@ -126,6 +126,43 @@ def _read_csv(stem: str) -> pd.DataFrame | None:
             zf.close()
 
 
+def _fit_categorical_encoder(frame: pd.DataFrame, feature_columns: list[str]) -> dict[str, list[str]]:
+    """Ordinal maps for non-numeric feature columns.
+
+    FinetunedTabICLRegressor fails on raw string/categorical features
+    (upstream soda-inria/tabicl#118), so object/string/category/bool feature
+    columns are ordinal-encoded before fine-tuning. The returned map is
+    {column: [category, ...]}; a value's code is its index in that list, and
+    any missing or unseen value maps to len(categories) — a dedicated unknown
+    bucket. Numeric (non-bool) columns are passed through untouched.
+    """
+    encoders: dict[str, list[str]] = {}
+    for col in feature_columns:
+        series = frame[col]
+        if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
+            continue
+        encoders[col] = sorted({str(v) for v in series.dropna().unique()})
+    return encoders
+
+
+def _apply_categorical_encoder(frame: pd.DataFrame, encoders: dict[str, list[str]]) -> pd.DataFrame:
+    """Apply persisted ordinal maps; missing/unseen values go to the unknown bucket."""
+    if not encoders:
+        return frame
+    out = frame.copy()
+    for col, categories in encoders.items():
+        if col not in out.columns:
+            continue
+        index = {cat: code for code, cat in enumerate(categories)}
+        unknown = len(categories)
+        out[col] = pd.Series(
+            [unknown if pd.isna(v) else index.get(str(v), unknown) for v in frame[col]],
+            index=frame.index,
+            dtype="int64",
+        )
+    return out
+
+
 def _clean_frame(frame: pd.DataFrame, target: str, drop_columns: list[str]) -> pd.DataFrame:
     if target not in frame.columns:
         raise KeyError(f"target column {target!r} not found")
@@ -229,6 +266,18 @@ def run() -> int:
     seed = int(hp.get("seed") or 0)
     train, val, test, target, feature_columns = _prepare_frames(pre, seed)
 
+    # Ordinal-encode categorical feature columns (upstream #118: fine-tuning
+    # fails on raw strings). Fit on the training context; keep a raw val copy
+    # so the reload smoke can exercise the persisted encoder end-to-end.
+    categorical_encoders = _fit_categorical_encoder(train, feature_columns)
+    if categorical_encoders:
+        log(f"Ordinal-encoding categorical features: {sorted(categorical_encoders)}")
+    val_raw = val
+    train = _apply_categorical_encoder(train, categorical_encoders)
+    val = _apply_categorical_encoder(val, categorical_encoders)
+    if test is not None:
+        test = _apply_categorical_encoder(test, categorical_encoders)
+
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError("TabICLv2 fine-tuning requires a CUDA GPU in this DIMER pipeline")
@@ -299,8 +348,11 @@ def run() -> int:
             "randomState": seed,
             "device": "cuda",
             "allowAutoDownload": False,
+            "categoricalEncoders": categorical_encoders,
+            "encoding": "ordinal; code = index in categoricalEncoders[col]; missing/unseen = len(list)",
             "procedure": (
                 "TabICLRegressor(model_path, **inference); "
+                "apply categoricalEncoders to X; "
                 "fit(context[featureColumns], context[targetColumn]); "
                 "predict(X[featureColumns])"
             ),
@@ -327,9 +379,10 @@ def run() -> int:
         device=inference["device"],
     )
     reloaded.fit(ctx_features, ctx_target)
-    smoke_rows = min(8, len(val))
+    smoke_rows = min(8, len(val_raw))
     if smoke_rows:
-        _ = reloaded.predict(X_val[served["featureColumns"]].iloc[:smoke_rows])
+        smoke_X = _apply_categorical_encoder(val_raw, inference.get("categoricalEncoders", {}))
+        _ = reloaded.predict(smoke_X[served["featureColumns"]].iloc[:smoke_rows])
 
     # Keep only best.ckpt in the served artifact; drop intermediate epoch checkpoints.
     pruned_bytes = 0

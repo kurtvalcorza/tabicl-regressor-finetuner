@@ -28,3 +28,36 @@ def test_metrics_do_not_clip_predictions():
     frame = pd.DataFrame({"x": [0, 1], "target": [-3.0, 2.0]})
     metrics = train._regression_metrics(Model(), frame, "target")
     assert metrics["mae"] == 1.0
+
+
+def test_categorical_encoder_ordinal_numeric_passthrough_and_unknown():
+    frame = pd.DataFrame(
+        {
+            "num": [1.0, 2.0, 3.0],
+            "cat": ["b", "a", "b"],
+            "flag": [True, False, True],
+            "target": [0.5, 1.5, 2.5],
+        }
+    )
+    enc = train._fit_categorical_encoder(frame, ["num", "cat", "flag"])
+    assert "num" not in enc  # numeric passthrough
+    assert enc["cat"] == ["a", "b"]  # sorted categories
+    assert enc["flag"] == ["False", "True"]
+
+    out = train._apply_categorical_encoder(frame, enc)
+    assert list(out["cat"]) == [1, 0, 1]  # b=1, a=0
+    assert list(out["flag"]) == [1, 0, 1]  # True=1, False=0
+    assert list(out["num"]) == [1.0, 2.0, 3.0]  # unchanged
+
+    # unseen category and missing value both fall into the unknown bucket (len)
+    infer = pd.DataFrame({"num": [9.0, 9.0], "cat": ["z", None], "flag": [True, None]})
+    enc_infer = train._apply_categorical_encoder(infer, enc)
+    assert list(enc_infer["cat"]) == [2, 2]  # z unseen -> 2, None -> 2
+    assert list(enc_infer["flag"]) == [1, 2]  # True -> 1, None -> 2 (unknown)
+
+
+def test_categorical_encoder_empty_when_all_numeric():
+    frame = pd.DataFrame({"a": [1.0, 2.0], "b": [3, 4], "target": [0.1, 0.2]})
+    enc = train._fit_categorical_encoder(frame, ["a", "b"])
+    assert enc == {}
+    assert train._apply_categorical_encoder(frame, enc) is frame  # no-op passthrough
