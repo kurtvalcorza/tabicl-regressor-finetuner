@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 SPEC = importlib.util.spec_from_file_location("train", Path(__file__).parents[1] / "train.py")
 train = importlib.util.module_from_spec(SPEC)
@@ -61,3 +62,17 @@ def test_categorical_encoder_empty_when_all_numeric():
     enc = train._fit_categorical_encoder(frame, ["a", "b"])
     assert enc == {}
     assert train._apply_categorical_encoder(frame, enc) is frame  # no-op passthrough
+
+
+def test_normalize_member_rejects_traversal_and_absolute():
+    assert train._normalize_member("train.csv") == "train.csv"
+    assert train._normalize_member("./train.csv") == "train.csv"
+    assert train._normalize_member("dataset/train.csv") == "train.csv"
+    for hostile in ("../train.csv", "../../etc/passwd", "/train.csv", "dataset/../secret.csv"):
+        with pytest.raises(ValueError, match="unsafe archive member"):
+            train._normalize_member(hostile)
+
+
+def test_prepare_frames_rejects_target_in_drop_columns():
+    with pytest.raises(ValueError, match="must not appear in drop_columns"):
+        train._prepare_frames({"target_column": "target", "drop_columns": "target,x"}, 0)
