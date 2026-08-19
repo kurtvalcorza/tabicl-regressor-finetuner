@@ -15,3 +15,15 @@ jobs:
       - run: python -m py_compile train.py
       - run: python -m json.tool dimer-pipeline.json > /dev/null
       - run: pytest -q
+
+  tabicl:
+    # Installs the pinned tabicl so the API-surface tests actually run; catches
+    # upstream API drift. The GPU fine-tune integration test skips (no CUDA here).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt pytest
+      - run: pytest -q
