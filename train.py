@@ -303,6 +303,14 @@ def run() -> int:
     if smoke_rows:
         _ = reloaded.predict(X_val.iloc[:smoke_rows])
 
+    # Keep only best.ckpt in the served artifact; drop intermediate epoch checkpoints.
+    pruned_bytes = 0
+    for stale in sorted(ckpt_dir.glob("epoch*.ckpt")):
+        pruned_bytes += stale.stat().st_size
+        stale.unlink()
+    if pruned_bytes:
+        log(f"Pruned {pruned_bytes} bytes of intermediate epoch checkpoints")
+
     payload = {
         "successful": True,
         "message": f"TabICLv2 fine-tuning succeeded on {len(train)} rows; validation MAE {val_metrics['mae']:.4f}.",
