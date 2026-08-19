@@ -277,8 +277,13 @@ def run() -> int:
     val_metrics = _regression_metrics(model, val, target)
     test_metrics = _regression_metrics(model, test, target) if test is not None and len(test) else None
 
+    # Build a portable inference artifact: fine-tuned checkpoint + the ICL context table.
     context_path = artifact_dir / "training_context.parquet"
     train.to_parquet(context_path, index=False)
+    checkpoint_sha256 = _sha256(best_ckpt)
+    training_context_sha256 = _sha256(context_path)
+    # artifact.json is the complete inference contract: everything a serving
+    # process needs to rebuild the exact model that produced the reported metrics.
     manifest = {
         "artifactFormat": "tabicl-dimer-regressor-v1",
         "checkpoint": "checkpoints/best.ckpt",
@@ -287,21 +292,44 @@ def run() -> int:
         "featureColumns": feature_columns,
         "baseCheckpoint": BASE_MODEL,
         "tabiclVersion": TABICL_VERSION,
-        "reload": "TabICLRegressor(model_path=best.ckpt); fit(X_context, y_context); predict(X)",
+        "inference": {
+            "class": "TabICLRegressor",
+            "modelPath": "checkpoints/best.ckpt",
+            "nEstimators": n_inf,
+            "randomState": seed,
+            "device": "cuda",
+            "allowAutoDownload": False,
+            "procedure": (
+                "TabICLRegressor(model_path, **inference); "
+                "fit(context[featureColumns], context[targetColumn]); "
+                "predict(X[featureColumns])"
+            ),
+        },
+        "digests": {
+            "checkpointSha256": checkpoint_sha256,
+            "trainingContextSha256": training_context_sha256,
+        },
     }
     (artifact_dir / "artifact.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
+    # Prove the artifact is a self-contained inference contract: reconstruct the
+    # model using ONLY artifact.json + the context table, then predict.
+    served = json.loads((artifact_dir / "artifact.json").read_text(encoding="utf-8"))
+    inference = served["inference"]
+    context = pd.read_parquet(artifact_dir / served["trainingContext"])
+    ctx_features = context[served["featureColumns"]]
+    ctx_target = context[served["targetColumn"]]
     reloaded = TabICLRegressor(
-        model_path=str(best_ckpt),
-        allow_auto_download=False,
-        n_estimators=n_inf,
-        random_state=seed,
-        device="cuda",
+        model_path=str(artifact_dir / inference["modelPath"]),
+        allow_auto_download=inference["allowAutoDownload"],
+        n_estimators=inference["nEstimators"],
+        random_state=inference["randomState"],
+        device=inference["device"],
     )
-    reloaded.fit(X_train, y_train)
+    reloaded.fit(ctx_features, ctx_target)
     smoke_rows = min(8, len(val))
     if smoke_rows:
-        _ = reloaded.predict(X_val.iloc[:smoke_rows])
+        _ = reloaded.predict(X_val[served["featureColumns"]].iloc[:smoke_rows])
 
     # Keep only best.ckpt in the served artifact; drop intermediate epoch checkpoints.
     pruned_bytes = 0
@@ -323,7 +351,7 @@ def run() -> int:
             "mode": "fine-tune",
         },
         "artifacts": {"modelDir": str(artifact_dir), "checkpoint": str(best_ckpt), "trainingContext": str(context_path)},
-        "provenance": {"baseModel": BASE_MODEL, "tabiclVersion": TABICL_VERSION, "fineTunedCheckpointSha256": _sha256(best_ckpt), "dataset": _dataset_digest()},
+        "provenance": {"baseModel": BASE_MODEL, "tabiclVersion": TABICL_VERSION, "fineTunedCheckpointSha256": checkpoint_sha256, "trainingContextSha256": training_context_sha256, "artifactDigestSha256": hashlib.sha256((checkpoint_sha256 + training_context_sha256).encode("utf-8")).hexdigest(), "dataset": _dataset_digest()},
         "metadata": {"template": TEMPLATE_NAME, "taskType": "tabular_regression", "targetColumn": target, "seed": seed, "epochs": epochs, "learningRate": learning_rate, "evalMetric": eval_metric},
     }
     write_result(payload)
