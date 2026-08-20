@@ -47,6 +47,34 @@ def test_batched_predict_chunks_and_matches(monkeypatch):
     assert calls == [3, 3, 3, 1]
 
 
+def test_resolve_base_model_missing_provided_path_errors(tmp_path, monkeypatch):
+    monkeypatch.setenv("DIMER_BASE_MODEL_PATH", str(tmp_path / "nope.ckpt"))
+    monkeypatch.delenv("TABICL_BAKED_BASE_MODEL", raising=False)
+    with pytest.raises(RuntimeError, match="does not exist"):
+        train._resolve_base_model()
+
+
+def test_resolve_base_model_custom_provided_provenance(tmp_path, monkeypatch):
+    f = tmp_path / "custom.ckpt"
+    f.write_bytes(b"not the pinned checkpoint")
+    monkeypatch.setenv("DIMER_BASE_MODEL_PATH", str(f))
+    monkeypatch.delenv("TABICL_BAKED_BASE_MODEL", raising=False)
+    path, sha, source, matches, rev = train._resolve_base_model()
+    assert path == f
+    assert source == "dimer-provided"
+    assert matches is False
+    assert rev is None  # a custom base must not claim the pinned revision
+
+
+def test_resolve_base_model_baked_mismatch_errors(tmp_path, monkeypatch):
+    f = tmp_path / "baked.ckpt"
+    f.write_bytes(b"wrong baked bytes")
+    monkeypatch.delenv("DIMER_BASE_MODEL_PATH", raising=False)
+    monkeypatch.setenv("TABICL_BAKED_BASE_MODEL", str(f))
+    with pytest.raises(RuntimeError, match="pinned"):
+        train._resolve_base_model()
+
+
 def test_clean_frame_keeps_negative_targets():
     frame = pd.DataFrame({"x": [1, 2, 3], "target": [-5.0, 0.0, 2.5]})
     out = train._clean_frame(frame, "target", [])

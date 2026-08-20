@@ -305,6 +305,51 @@ def _dataset_digest() -> dict[str, Any] | None:
     return {"files": [p.relative_to(DATASET_DIR).as_posix() for p in csvs], "sha256": h.hexdigest()}
 
 
+def _resolve_base_model() -> tuple[Path, str, str, bool, str | None]:
+    """Resolve the base checkpoint and its provenance.
+
+    Precedence:
+      1. DIMER_BASE_MODEL_PATH   — a DIMER-selected base model mounted into the
+         container. It MUST exist: a configured-but-missing path is an error,
+         never a silent fallback to the default. Used as-is; source
+         "dimer-provided".
+      2. TABICL_BAKED_BASE_MODEL — the pinned default baked into the image;
+         source "pinned-baked", SHA-256-verified.
+      3. otherwise download the pinned default at its revision; source
+         "pinned-download", SHA-256-verified.
+
+    Returns (path, sha256, source, matches_pinned, revision). `revision` is the
+    pinned revision only when the bytes match the pinned default, so a custom
+    base never falsely claims the pinned revision; otherwise it is None.
+    """
+    provided = os.getenv("DIMER_BASE_MODEL_PATH", "").strip()
+    baked = os.getenv("TABICL_BAKED_BASE_MODEL", "").strip()
+    if provided:
+        path = Path(provided)
+        if not path.exists():
+            raise RuntimeError(
+                f"DIMER_BASE_MODEL_PATH={provided!r} was set but the file does not exist"
+            )
+        source = "dimer-provided"
+    elif baked and Path(baked).exists():
+        path = Path(baked)
+        source = "pinned-baked"
+    else:
+        from huggingface_hub import hf_hub_download
+
+        path = Path(hf_hub_download(BASE_MODEL_REPO, BASE_MODEL, revision=BASE_MODEL_REVISION))
+        source = "pinned-download"
+    sha256 = _sha256(path)
+    matches_pinned = sha256 == BASE_MODEL_SHA256
+    if source != "dimer-provided" and not matches_pinned:
+        raise RuntimeError(
+            f"{source} base checkpoint sha256 {sha256} does not match the pinned "
+            f"{BASE_MODEL_SHA256} at revision {BASE_MODEL_REVISION}"
+        )
+    revision = BASE_MODEL_REVISION if matches_pinned else None
+    return path, sha256, source, matches_pinned, revision
+
+
 def run() -> int:
     _load_limits()
     hp = _json_env("DIMER_HYPERPARAMETERS_JSON")
@@ -330,27 +375,8 @@ def run() -> int:
 
     from tabicl import FinetunedTabICLRegressor, TabICLRegressor
 
-    # Base-model handoff. This pipeline is fixed to the pinned TabICLv2 regressor
-    # checkpoint by default, but DIMER can override it by mounting its selected
-    # Base Model and setting DIMER_BASE_MODEL_PATH. A provided path is used as-is
-    # and its SHA-256 recorded; the pinned-download path is SHA-verified so a
-    # moved "main" cannot silently change the default base.
-    from huggingface_hub import hf_hub_download
-    provided = os.getenv("DIMER_BASE_MODEL_PATH", "").strip()
-    if provided and Path(provided).exists():
-        base_ckpt = Path(provided)
-        base_source = "provided-path"
-    else:
-        base_ckpt = Path(hf_hub_download(BASE_MODEL_REPO, BASE_MODEL, revision=BASE_MODEL_REVISION))
-        base_source = "pinned-download"
-    base_model_sha256 = _sha256(base_ckpt)
-    base_matches_pinned = base_model_sha256 == BASE_MODEL_SHA256
-    if base_source == "pinned-download" and not base_matches_pinned:
-        raise RuntimeError(
-            f"base checkpoint sha256 {base_model_sha256} does not match the pinned "
-            f"{BASE_MODEL_SHA256} at revision {BASE_MODEL_REVISION}"
-        )
-    if base_source == "provided-path" and not base_matches_pinned:
+    base_ckpt, base_model_sha256, base_source, base_matches_pinned, base_revision = _resolve_base_model()
+    if base_source == "dimer-provided" and not base_matches_pinned:
         log(
             f"Using a DIMER-provided base checkpoint (sha256 {base_model_sha256}) that "
             f"differs from the pinned default {BASE_MODEL_SHA256}."
@@ -413,7 +439,7 @@ def run() -> int:
         "targetColumn": target,
         "featureColumns": feature_columns,
         "baseCheckpoint": BASE_MODEL,
-        "baseModelRevision": BASE_MODEL_REVISION,
+        "baseModelRevision": base_revision,
         "baseModelSha256": base_model_sha256,
         "baseModelSource": base_source,
         "baseMatchesPinned": base_matches_pinned,
@@ -481,7 +507,7 @@ def run() -> int:
             "mode": "fine-tune",
         },
         "artifacts": {"modelDir": str(artifact_dir), "checkpoint": str(best_ckpt), "trainingContext": str(context_path)},
-        "provenance": {"baseModel": BASE_MODEL, "baseModelRevision": BASE_MODEL_REVISION, "baseModelSha256": base_model_sha256, "baseModelSource": base_source, "baseMatchesPinned": base_matches_pinned, "tabiclVersion": TABICL_VERSION, "fineTunedCheckpointSha256": checkpoint_sha256, "trainingContextSha256": training_context_sha256, "artifactDigestSha256": hashlib.sha256((checkpoint_sha256 + training_context_sha256).encode("utf-8")).hexdigest(), "dataset": _dataset_digest()},
+        "provenance": {"baseModel": BASE_MODEL, "baseModelRevision": base_revision, "baseModelSha256": base_model_sha256, "baseModelSource": base_source, "baseMatchesPinned": base_matches_pinned, "tabiclVersion": TABICL_VERSION, "fineTunedCheckpointSha256": checkpoint_sha256, "trainingContextSha256": training_context_sha256, "artifactDigestSha256": hashlib.sha256((checkpoint_sha256 + training_context_sha256).encode("utf-8")).hexdigest(), "dataset": _dataset_digest()},
         "metadata": {"template": TEMPLATE_NAME, "taskType": "tabular_regression", "targetColumn": target, "seed": seed, "epochs": epochs, "learningRate": learning_rate, "evalMetric": eval_metric},
     }
     write_result(payload)
