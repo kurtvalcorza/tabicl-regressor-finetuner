@@ -46,6 +46,8 @@ def test_finetune_end_to_end(tmp_path, monkeypatch):
     assert payload["successful"] is True
     assert payload["provenance"]["baseModelRevision"]
     assert payload["provenance"]["baseModelSha256"]
+    assert payload["provenance"]["baseModelSource"] in ("provided-path", "pinned-download")
+    assert payload["provenance"]["baseMatchesPinned"] is True
     art = json.loads((out / "tabicl_regressor" / "artifact.json").read_text())
     assert "inference" in art
     assert "categoricalEncoders" in art["inference"]

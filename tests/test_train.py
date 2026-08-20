@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -7,7 +9,42 @@ import pytest
 
 SPEC = importlib.util.spec_from_file_location("train", Path(__file__).parents[1] / "train.py")
 train = importlib.util.module_from_spec(SPEC)
+sys.modules["train"] = train
 SPEC.loader.exec_module(train)
+
+
+@pytest.fixture(autouse=True)
+def _reset_limits():
+    train._load_limits()
+    yield
+
+
+def test_load_limits_rejects_malformed_env(monkeypatch):
+    monkeypatch.setenv("DIMER_MAX_SINGLE_CSV_BYTES", "not-an-int")
+    with pytest.raises(ValueError):
+        train._load_limits()
+
+
+def test_main_writes_failure_on_malformed_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("DIMER_MAX_SINGLE_CSV_BYTES", "not-an-int")
+    monkeypatch.setattr(train, "RESULT_PATH", tmp_path / "result.json")
+    assert train.main() == 1
+    payload = json.loads((tmp_path / "result.json").read_text())
+    assert payload["successful"] is False
+
+
+def test_batched_predict_chunks_and_matches(monkeypatch):
+    monkeypatch.setattr(train, "PREDICT_BATCH_ROWS", 3)
+    X = pd.DataFrame({"a": range(10)})
+    calls = []
+
+    def fake(sub):
+        calls.append(len(sub))
+        return sub["a"].to_numpy()
+
+    out = train._batched(fake, X)
+    assert list(out) == list(range(10))
+    assert calls == [3, 3, 3, 1]
 
 
 def test_clean_frame_keeps_negative_targets():
