@@ -33,6 +33,15 @@ def test_main_writes_failure_on_malformed_config(tmp_path, monkeypatch):
     assert payload["successful"] is False
 
 
+def test_invalid_timeout_does_not_corrupt_global(monkeypatch):
+    monkeypatch.setenv("DIMER_CALLBACK_TIMEOUT_SECONDS", "-5")
+    prior = train.CALLBACK_TIMEOUT_SECONDS
+    with pytest.raises(ValueError):
+        train._load_limits()
+    assert train.CALLBACK_TIMEOUT_SECONDS == prior
+    assert train.CALLBACK_TIMEOUT_SECONDS > 0
+
+
 def test_batched_predict_chunks_and_matches(monkeypatch):
     monkeypatch.setattr(train, "PREDICT_BATCH_ROWS", 3)
     X = pd.DataFrame({"a": range(10)})

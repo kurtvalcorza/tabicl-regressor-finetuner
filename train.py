@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sys
 import traceback
@@ -53,12 +54,32 @@ def _float_env(name: str, default: float) -> float:
 
 
 def _load_limits() -> None:
-    """Re-read numeric limits from the environment inside the protected path."""
+    """Re-read numeric limits from the environment inside the protected path.
+
+    Values are parsed and validated into locals FIRST, and published to the
+    module globals only after every check passes — so a malformed value never
+    leaves an invalid global behind (e.g. the crash-path callback must still see
+    a valid CALLBACK_TIMEOUT_SECONDS).
+    """
+    callback_timeout = _float_env("DIMER_CALLBACK_TIMEOUT_SECONDS", 10.0)
+    max_archive = _int_env("DIMER_MAX_ARCHIVE_UNCOMPRESSED_BYTES", 1 << 30)
+    max_single = _int_env("DIMER_MAX_SINGLE_CSV_BYTES", 512 << 20)
+    predict_batch = max(1, _int_env("DIMER_PREDICT_BATCH_ROWS", 8192))
+    if not math.isfinite(callback_timeout) or callback_timeout <= 0:
+        raise ValueError(
+            f"DIMER_CALLBACK_TIMEOUT_SECONDS must be a positive finite number, got {callback_timeout!r}"
+        )
+    for _name, _val in (
+        ("DIMER_MAX_ARCHIVE_UNCOMPRESSED_BYTES", max_archive),
+        ("DIMER_MAX_SINGLE_CSV_BYTES", max_single),
+    ):
+        if _val <= 0:
+            raise ValueError(f"{_name} must be a positive integer, got {_val!r}")
     global CALLBACK_TIMEOUT_SECONDS, MAX_ARCHIVE_UNCOMPRESSED_BYTES, MAX_SINGLE_CSV_BYTES, PREDICT_BATCH_ROWS
-    CALLBACK_TIMEOUT_SECONDS = _float_env("DIMER_CALLBACK_TIMEOUT_SECONDS", 10.0)
-    MAX_ARCHIVE_UNCOMPRESSED_BYTES = _int_env("DIMER_MAX_ARCHIVE_UNCOMPRESSED_BYTES", 1 << 30)
-    MAX_SINGLE_CSV_BYTES = _int_env("DIMER_MAX_SINGLE_CSV_BYTES", 512 << 20)
-    PREDICT_BATCH_ROWS = max(1, _int_env("DIMER_PREDICT_BATCH_ROWS", 8192))
+    CALLBACK_TIMEOUT_SECONDS = callback_timeout
+    MAX_ARCHIVE_UNCOMPRESSED_BYTES = max_archive
+    MAX_SINGLE_CSV_BYTES = max_single
+    PREDICT_BATCH_ROWS = predict_batch
 
 
 def log(message: str) -> None:
@@ -256,14 +277,22 @@ def _prepare_frames(pre: dict[str, Any], seed: int) -> tuple[pd.DataFrame, pd.Da
 
 
 def _batched(predict_fn, X: pd.DataFrame) -> np.ndarray:
-    """Call a predict function in row batches to bound peak memory on large frames."""
-    if len(X) <= PREDICT_BATCH_ROWS:
+    """Call a predict function in row batches to bound peak memory on large frames.
+
+    Preallocates the output and fills it batch by batch, so only one batch plus
+    the single destination array are live at once (no list of all batches plus a
+    concatenated copy).
+    """
+    n = len(X)
+    if n <= PREDICT_BATCH_ROWS:
         return np.asarray(predict_fn(X))
-    parts = [
-        np.asarray(predict_fn(X.iloc[i:i + PREDICT_BATCH_ROWS]))
-        for i in range(0, len(X), PREDICT_BATCH_ROWS)
-    ]
-    return np.concatenate(parts, axis=0)
+    first = np.asarray(predict_fn(X.iloc[:PREDICT_BATCH_ROWS]))
+    out = np.empty((n,) + first.shape[1:], dtype=first.dtype)
+    out[: len(first)] = first
+    for i in range(PREDICT_BATCH_ROWS, n, PREDICT_BATCH_ROWS):
+        chunk = np.asarray(predict_fn(X.iloc[i:i + PREDICT_BATCH_ROWS]))
+        out[i:i + len(chunk)] = chunk
+    return out
 
 
 def _regression_metrics(model, frame: pd.DataFrame, target: str) -> dict[str, Any]:
