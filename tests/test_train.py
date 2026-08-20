@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -7,7 +9,79 @@ import pytest
 
 SPEC = importlib.util.spec_from_file_location("train", Path(__file__).parents[1] / "train.py")
 train = importlib.util.module_from_spec(SPEC)
+sys.modules["train"] = train
 SPEC.loader.exec_module(train)
+
+
+@pytest.fixture(autouse=True)
+def _reset_limits():
+    train._load_limits()
+    yield
+
+
+def test_load_limits_rejects_malformed_env(monkeypatch):
+    monkeypatch.setenv("DIMER_MAX_SINGLE_CSV_BYTES", "not-an-int")
+    with pytest.raises(ValueError):
+        train._load_limits()
+
+
+def test_main_writes_failure_on_malformed_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("DIMER_MAX_SINGLE_CSV_BYTES", "not-an-int")
+    monkeypatch.setattr(train, "RESULT_PATH", tmp_path / "result.json")
+    assert train.main() == 1
+    payload = json.loads((tmp_path / "result.json").read_text())
+    assert payload["successful"] is False
+
+
+def test_invalid_timeout_does_not_corrupt_global(monkeypatch):
+    monkeypatch.setenv("DIMER_CALLBACK_TIMEOUT_SECONDS", "-5")
+    prior = train.CALLBACK_TIMEOUT_SECONDS
+    with pytest.raises(ValueError):
+        train._load_limits()
+    assert train.CALLBACK_TIMEOUT_SECONDS == prior
+    assert train.CALLBACK_TIMEOUT_SECONDS > 0
+
+
+def test_batched_predict_chunks_and_matches(monkeypatch):
+    monkeypatch.setattr(train, "PREDICT_BATCH_ROWS", 3)
+    X = pd.DataFrame({"a": range(10)})
+    calls = []
+
+    def fake(sub):
+        calls.append(len(sub))
+        return sub["a"].to_numpy()
+
+    out = train._batched(fake, X)
+    assert list(out) == list(range(10))
+    assert calls == [3, 3, 3, 1]
+
+
+def test_resolve_base_model_missing_provided_path_errors(tmp_path, monkeypatch):
+    monkeypatch.setenv("DIMER_BASE_MODEL_PATH", str(tmp_path / "nope.ckpt"))
+    monkeypatch.delenv("TABICL_BAKED_BASE_MODEL", raising=False)
+    with pytest.raises(RuntimeError, match="does not exist"):
+        train._resolve_base_model()
+
+
+def test_resolve_base_model_custom_provided_provenance(tmp_path, monkeypatch):
+    f = tmp_path / "custom.ckpt"
+    f.write_bytes(b"not the pinned checkpoint")
+    monkeypatch.setenv("DIMER_BASE_MODEL_PATH", str(f))
+    monkeypatch.delenv("TABICL_BAKED_BASE_MODEL", raising=False)
+    path, sha, source, matches, rev = train._resolve_base_model()
+    assert path == f
+    assert source == "dimer-provided"
+    assert matches is False
+    assert rev is None  # a custom base must not claim the pinned revision
+
+
+def test_resolve_base_model_baked_mismatch_errors(tmp_path, monkeypatch):
+    f = tmp_path / "baked.ckpt"
+    f.write_bytes(b"wrong baked bytes")
+    monkeypatch.delenv("DIMER_BASE_MODEL_PATH", raising=False)
+    monkeypatch.setenv("TABICL_BAKED_BASE_MODEL", str(f))
+    with pytest.raises(RuntimeError, match="pinned"):
+        train._resolve_base_model()
 
 
 def test_clean_frame_keeps_negative_targets():

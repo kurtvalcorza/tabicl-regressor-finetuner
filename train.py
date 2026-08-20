@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sys
 import traceback
@@ -29,11 +30,56 @@ DATASET_DIR = Path(os.getenv("DIMER_DATASET_DIR", "/data/dataset"))
 OUTPUT_DIR = Path(os.getenv("DIMER_OUTPUT_DIR", "/data/output"))
 RESULT_PATH = Path(os.getenv("DIMER_RESULT_PATH", "/data/results/result.json"))
 DONE_CALLBACK = os.getenv("DIMER_DONE_CALLBACK", "").strip()
-CALLBACK_TIMEOUT_SECONDS = float(os.getenv("DIMER_CALLBACK_TIMEOUT_SECONDS", "10"))
-MAX_ARCHIVE_UNCOMPRESSED_BYTES = int(os.getenv("DIMER_MAX_ARCHIVE_UNCOMPRESSED_BYTES", str(1 << 30)))
-MAX_SINGLE_CSV_BYTES = int(os.getenv("DIMER_MAX_SINGLE_CSV_BYTES", str(512 << 20)))
 MAX_FEATURES = 2_000
 MIN_TRAIN_ROWS = 50
+
+# Numeric/limit configuration. Module-level DEFAULTS (plain literals so import
+# never fails); values used are (re)loaded from the environment inside the
+# protected run() via _load_limits(), so a malformed platform value produces a
+# structured failure result.json instead of an import-time crash.
+CALLBACK_TIMEOUT_SECONDS = 10.0
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = 1 << 30
+MAX_SINGLE_CSV_BYTES = 512 << 20
+PREDICT_BATCH_ROWS = 8192  # bound single predict() calls to avoid avoidable OOM
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    return default if raw is None or raw.strip() == "" else int(raw)
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    return default if raw is None or raw.strip() == "" else float(raw)
+
+
+def _load_limits() -> None:
+    """Re-read numeric limits from the environment inside the protected path.
+
+    Values are parsed and validated into locals FIRST, and published to the
+    module globals only after every check passes — so a malformed value never
+    leaves an invalid global behind (e.g. the crash-path callback must still see
+    a valid CALLBACK_TIMEOUT_SECONDS).
+    """
+    callback_timeout = _float_env("DIMER_CALLBACK_TIMEOUT_SECONDS", 10.0)
+    max_archive = _int_env("DIMER_MAX_ARCHIVE_UNCOMPRESSED_BYTES", 1 << 30)
+    max_single = _int_env("DIMER_MAX_SINGLE_CSV_BYTES", 512 << 20)
+    predict_batch = max(1, _int_env("DIMER_PREDICT_BATCH_ROWS", 8192))
+    if not math.isfinite(callback_timeout) or callback_timeout <= 0:
+        raise ValueError(
+            f"DIMER_CALLBACK_TIMEOUT_SECONDS must be a positive finite number, got {callback_timeout!r}"
+        )
+    for _name, _val in (
+        ("DIMER_MAX_ARCHIVE_UNCOMPRESSED_BYTES", max_archive),
+        ("DIMER_MAX_SINGLE_CSV_BYTES", max_single),
+    ):
+        if _val <= 0:
+            raise ValueError(f"{_name} must be a positive integer, got {_val!r}")
+    global CALLBACK_TIMEOUT_SECONDS, MAX_ARCHIVE_UNCOMPRESSED_BYTES, MAX_SINGLE_CSV_BYTES, PREDICT_BATCH_ROWS
+    CALLBACK_TIMEOUT_SECONDS = callback_timeout
+    MAX_ARCHIVE_UNCOMPRESSED_BYTES = max_archive
+    MAX_SINGLE_CSV_BYTES = max_single
+    PREDICT_BATCH_ROWS = predict_batch
 
 
 def log(message: str) -> None:
@@ -230,10 +276,29 @@ def _prepare_frames(pre: dict[str, Any], seed: int) -> tuple[pd.DataFrame, pd.Da
     return train, val, test, target, feature_columns
 
 
+def _batched(predict_fn, X: pd.DataFrame) -> np.ndarray:
+    """Call a predict function in row batches to bound peak memory on large frames.
+
+    Preallocates the output and fills it batch by batch, so only one batch plus
+    the single destination array are live at once (no list of all batches plus a
+    concatenated copy).
+    """
+    n = len(X)
+    if n <= PREDICT_BATCH_ROWS:
+        return np.asarray(predict_fn(X))
+    first = np.asarray(predict_fn(X.iloc[:PREDICT_BATCH_ROWS]))
+    out = np.empty((n,) + first.shape[1:], dtype=first.dtype)
+    out[: len(first)] = first
+    for i in range(PREDICT_BATCH_ROWS, n, PREDICT_BATCH_ROWS):
+        chunk = np.asarray(predict_fn(X.iloc[i:i + PREDICT_BATCH_ROWS]))
+        out[i:i + len(chunk)] = chunk
+    return out
+
+
 def _regression_metrics(model, frame: pd.DataFrame, target: str) -> dict[str, Any]:
     X = frame.drop(columns=[target])
     y = frame[target].to_numpy(dtype=float)
-    pred = np.asarray(model.predict(X), dtype=float)
+    pred = _batched(model.predict, X).astype(float)
     mse = float(mean_squared_error(y, pred))
     return {
         "rows": int(len(frame)),
@@ -269,7 +334,53 @@ def _dataset_digest() -> dict[str, Any] | None:
     return {"files": [p.relative_to(DATASET_DIR).as_posix() for p in csvs], "sha256": h.hexdigest()}
 
 
+def _resolve_base_model() -> tuple[Path, str, str, bool, str | None]:
+    """Resolve the base checkpoint and its provenance.
+
+    Precedence:
+      1. DIMER_BASE_MODEL_PATH   — a DIMER-selected base model mounted into the
+         container. It MUST exist: a configured-but-missing path is an error,
+         never a silent fallback to the default. Used as-is; source
+         "dimer-provided".
+      2. TABICL_BAKED_BASE_MODEL — the pinned default baked into the image;
+         source "pinned-baked", SHA-256-verified.
+      3. otherwise download the pinned default at its revision; source
+         "pinned-download", SHA-256-verified.
+
+    Returns (path, sha256, source, matches_pinned, revision). `revision` is the
+    pinned revision only when the bytes match the pinned default, so a custom
+    base never falsely claims the pinned revision; otherwise it is None.
+    """
+    provided = os.getenv("DIMER_BASE_MODEL_PATH", "").strip()
+    baked = os.getenv("TABICL_BAKED_BASE_MODEL", "").strip()
+    if provided:
+        path = Path(provided)
+        if not path.exists():
+            raise RuntimeError(
+                f"DIMER_BASE_MODEL_PATH={provided!r} was set but the file does not exist"
+            )
+        source = "dimer-provided"
+    elif baked and Path(baked).exists():
+        path = Path(baked)
+        source = "pinned-baked"
+    else:
+        from huggingface_hub import hf_hub_download
+
+        path = Path(hf_hub_download(BASE_MODEL_REPO, BASE_MODEL, revision=BASE_MODEL_REVISION))
+        source = "pinned-download"
+    sha256 = _sha256(path)
+    matches_pinned = sha256 == BASE_MODEL_SHA256
+    if source != "dimer-provided" and not matches_pinned:
+        raise RuntimeError(
+            f"{source} base checkpoint sha256 {sha256} does not match the pinned "
+            f"{BASE_MODEL_SHA256} at revision {BASE_MODEL_REVISION}"
+        )
+    revision = BASE_MODEL_REVISION if matches_pinned else None
+    return path, sha256, source, matches_pinned, revision
+
+
 def run() -> int:
+    _load_limits()
     hp = _json_env("DIMER_HYPERPARAMETERS_JSON")
     pre = _json_env("DIMER_PREPROCESSING_ARGS_JSON")
     seed = int(hp.get("seed") or 0)
@@ -293,20 +404,11 @@ def run() -> int:
 
     from tabicl import FinetunedTabICLRegressor, TabICLRegressor
 
-    # Resolve the base checkpoint deterministically: the baked, revision-pinned
-    # copy if present, else a pinned-revision download. Verify its SHA-256, then
-    # fine-tune from the local file with auto-download disabled.
-    from huggingface_hub import hf_hub_download
-    baked = os.getenv("DIMER_BASE_MODEL_PATH", "").strip()
-    if baked and Path(baked).exists():
-        base_ckpt = Path(baked)
-    else:
-        base_ckpt = Path(hf_hub_download(BASE_MODEL_REPO, BASE_MODEL, revision=BASE_MODEL_REVISION))
-    base_model_sha256 = _sha256(base_ckpt)
-    if base_model_sha256 != BASE_MODEL_SHA256:
-        raise RuntimeError(
-            f"base checkpoint sha256 {base_model_sha256} does not match the pinned "
-            f"{BASE_MODEL_SHA256} at revision {BASE_MODEL_REVISION}"
+    base_ckpt, base_model_sha256, base_source, base_matches_pinned, base_revision = _resolve_base_model()
+    if base_source == "dimer-provided" and not base_matches_pinned:
+        log(
+            f"Using a DIMER-provided base checkpoint (sha256 {base_model_sha256}) that "
+            f"differs from the pinned default {BASE_MODEL_SHA256}."
         )
 
     epochs = int(hp.get("epochs") or 30)
@@ -366,8 +468,10 @@ def run() -> int:
         "targetColumn": target,
         "featureColumns": feature_columns,
         "baseCheckpoint": BASE_MODEL,
-        "baseModelRevision": BASE_MODEL_REVISION,
+        "baseModelRevision": base_revision,
         "baseModelSha256": base_model_sha256,
+        "baseModelSource": base_source,
+        "baseMatchesPinned": base_matches_pinned,
         "tabiclVersion": TABICL_VERSION,
         "inference": {
             "class": "TabICLRegressor",
@@ -432,7 +536,7 @@ def run() -> int:
             "mode": "fine-tune",
         },
         "artifacts": {"modelDir": str(artifact_dir), "checkpoint": str(best_ckpt), "trainingContext": str(context_path)},
-        "provenance": {"baseModel": BASE_MODEL, "baseModelRevision": BASE_MODEL_REVISION, "baseModelSha256": base_model_sha256, "tabiclVersion": TABICL_VERSION, "fineTunedCheckpointSha256": checkpoint_sha256, "trainingContextSha256": training_context_sha256, "artifactDigestSha256": hashlib.sha256((checkpoint_sha256 + training_context_sha256).encode("utf-8")).hexdigest(), "dataset": _dataset_digest()},
+        "provenance": {"baseModel": BASE_MODEL, "baseModelRevision": base_revision, "baseModelSha256": base_model_sha256, "baseModelSource": base_source, "baseMatchesPinned": base_matches_pinned, "tabiclVersion": TABICL_VERSION, "fineTunedCheckpointSha256": checkpoint_sha256, "trainingContextSha256": training_context_sha256, "artifactDigestSha256": hashlib.sha256((checkpoint_sha256 + training_context_sha256).encode("utf-8")).hexdigest(), "dataset": _dataset_digest()},
         "metadata": {"template": TEMPLATE_NAME, "taskType": "tabular_regression", "targetColumn": target, "seed": seed, "epochs": epochs, "learningRate": learning_rate, "evalMetric": eval_metric},
     }
     write_result(payload)

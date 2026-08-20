@@ -12,8 +12,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 ARG BASE_MODEL=tabicl-regressor-v2-20260212.ckpt
 ARG BASE_MODEL_REVISION=4dcd344ece2c00be9e831fdd35bed57b5ad83e19
 RUN python -c "import shutil; from huggingface_hub import hf_hub_download; shutil.copyfile(hf_hub_download('jingang/TabICL', '${BASE_MODEL}', revision='${BASE_MODEL_REVISION}'), '/app/${BASE_MODEL}')"
+# TABICL_BAKED_BASE_MODEL is the pinned default baked above. DIMER_BASE_MODEL_PATH
+# is deliberately NOT set here: it is reserved for a DIMER operator override, and
+# if set it must point at an existing mounted checkpoint (else the run fails).
 ENV DIMER_TASK_TYPE=tabular_regression \
-    DIMER_BASE_MODEL_PATH=/app/tabicl-regressor-v2-20260212.ckpt \
+    TABICL_BAKED_BASE_MODEL=/app/tabicl-regressor-v2-20260212.ckpt \
     DIMER_BASE_MODEL_REVISION=4dcd344ece2c00be9e831fdd35bed57b5ad83e19
 COPY train.py ./
 CMD ["python", "train.py"]
