@@ -96,6 +96,37 @@ def _json_env(name: str) -> dict[str, Any]:
     return value
 
 
+def _normalize_device_string(raw: str) -> str:
+    """Normalize a DIMER_TRAIN_DEVICE value to a torch CUDA device string.
+
+    DIMER may inject ``cuda:0``, a bare index like ``0`` (the documented
+    ``Invalid device string: '0'`` pitfall), or ``cpu``. This pipeline has no CPU
+    fine-tune path, so any non-CUDA request fails clearly rather than silently
+    defaulting to cuda:0.
+    """
+    raw = (raw or "").strip()
+    if raw.isdigit():
+        raw = f"cuda:{raw}"
+    if raw in ("", "cuda"):
+        return "cuda"
+    if raw.startswith("cuda:"):
+        return raw
+    raise RuntimeError(
+        f"TabICLv2 fine-tuning requires a CUDA GPU; DIMER_TRAIN_DEVICE={raw!r} is not supported"
+    )
+
+
+def _resolve_train_device() -> str:
+    """Resolve the training device from DIMER_TRAIN_DEVICE, honoring the operator's
+    GPU assignment. Requires CUDA to be available (no CPU fine-tune path)."""
+    device = _normalize_device_string(os.getenv("DIMER_TRAIN_DEVICE", ""))
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("TabICLv2 fine-tuning requires a CUDA GPU in this DIMER pipeline")
+    return device
+
+
 def write_result(payload: dict[str, Any]) -> None:
     RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
     RESULT_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
@@ -398,9 +429,7 @@ def run() -> int:
     if test is not None:
         test = _apply_categorical_encoder(test, categorical_encoders)
 
-    import torch
-    if not torch.cuda.is_available():
-        raise RuntimeError("TabICLv2 fine-tuning requires a CUDA GPU in this DIMER pipeline")
+    device = _resolve_train_device()
 
     from tabicl import FinetunedTabICLRegressor, TabICLRegressor
 
@@ -441,7 +470,7 @@ def run() -> int:
         eval_metric=eval_metric,
         model_path=str(base_ckpt),
         allow_auto_download=False,
-        device="cuda",
+        device=device,
         random_state=seed,
         verbose=True,
     )
@@ -478,6 +507,8 @@ def run() -> int:
             "modelPath": "checkpoints/best.ckpt",
             "nEstimators": n_inf,
             "randomState": seed,
+            # Portable serving default (the serving node picks its own GPU); the
+            # DIMER-assigned training device is recorded under result.json metrics.
             "device": "cuda",
             "allowAutoDownload": False,
             "categoricalEncoders": categorical_encoders,
@@ -508,7 +539,9 @@ def run() -> int:
         allow_auto_download=inference["allowAutoDownload"],
         n_estimators=inference["nEstimators"],
         random_state=inference["randomState"],
-        device=inference["device"],
+        # Run the training-time smoke on the DIMER-assigned GPU, not the artifact's
+        # portable serving default (inference["device"] == "cuda").
+        device=device,
     )
     reloaded.fit(ctx_features, ctx_target)
     smoke_rows = min(8, len(val_raw))
@@ -532,7 +565,7 @@ def run() -> int:
             "val": val_metrics,
             "test": test_metrics,
             "featureCount": len(feature_columns),
-            "device": "cuda",
+            "device": device,
             "mode": "fine-tune",
         },
         "artifacts": {"modelDir": str(artifact_dir), "checkpoint": str(best_ckpt), "trainingContext": str(context_path)},

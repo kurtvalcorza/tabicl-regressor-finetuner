@@ -170,3 +170,16 @@ def test_manifest_matches_env_consumption():
     assert hp_keys <= manifest_hp, f"consumed but undeclared hyperparameters: {hp_keys - manifest_hp}"
     assert pre_keys <= manifest_pre, f"consumed but undeclared preprocessing keys: {pre_keys - manifest_pre}"
     assert "model_id" not in manifest_hp | manifest_pre
+
+
+def test_normalize_device_string_honors_dimer_assignment():
+    # DIMER_TRAIN_DEVICE contract: honor the assigned GPU; normalize the bare-index
+    # pitfall ("0" -> "cuda:0"); reject non-CUDA (no CPU fine-tune path).
+    assert train._normalize_device_string("") == "cuda"
+    assert train._normalize_device_string("cuda") == "cuda"
+    assert train._normalize_device_string("0") == "cuda:0"
+    assert train._normalize_device_string("1") == "cuda:1"
+    assert train._normalize_device_string("cuda:1") == "cuda:1"
+    for bad in ("cpu", "mps", "gpu"):
+        with pytest.raises(RuntimeError, match="not supported"):
+            train._normalize_device_string(bad)
