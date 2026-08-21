@@ -15,9 +15,11 @@ RUN python -c "import shutil; from huggingface_hub import hf_hub_download; shuti
 # TABICL_BAKED_BASE_MODEL is the pinned default baked above. DIMER_BASE_MODEL_PATH
 # is deliberately NOT set here: it is reserved for a DIMER operator override, and
 # if set it must point at an existing mounted checkpoint (else the run fails).
-# (No baked DIMER_TASK_TYPE: the finetuner is single-task by construction and
-# never reads it; the resolved task arrives via DIMER_PIPELINE_METADATA_JSON.)
-ENV TABICL_BAKED_BASE_MODEL=/app/tabicl-regressor-v2-20260212.ckpt \
+# DIMER_TASK_TYPE is the baked Custom/Other-pipeline fallback (agreed compat
+# contract); train.py consumes it via _resolve_task_type when DIMER metadata
+# omits taskType.
+ENV DIMER_TASK_TYPE=tabular_regression \
+    TABICL_BAKED_BASE_MODEL=/app/tabicl-regressor-v2-20260212.ckpt \
     DIMER_BASE_MODEL_REVISION=4dcd344ece2c00be9e831fdd35bed57b5ad83e19
 COPY train.py ./
 CMD ["python", "train.py"]

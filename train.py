@@ -116,6 +116,16 @@ def _normalize_device_string(raw: str) -> str:
     )
 
 
+def _resolve_task_type(pipeline_metadata: dict[str, Any]) -> str:
+    """taskType precedence: DIMER metadata -> baked DIMER_TASK_TYPE env
+    (Custom/Other pipelines) -> model-family literal."""
+    return (
+        pipeline_metadata.get("taskType")
+        or os.getenv("DIMER_TASK_TYPE")
+        or "tabular_regression"
+    )
+
+
 def _resolve_train_device() -> str:
     """Resolve the training device from DIMER_TRAIN_DEVICE, honoring the operator's
     GPU assignment. Requires CUDA to be available (no CPU fine-tune path)."""
@@ -414,6 +424,7 @@ def run() -> int:
     _load_limits()
     hp = _json_env("DIMER_HYPERPARAMETERS_JSON")
     pre = _json_env("DIMER_PREPROCESSING_ARGS_JSON")
+    pipeline_metadata = _json_env("DIMER_PIPELINE_METADATA_JSON")
     seed = int(hp.get("seed") or 0)
     train, val, test, target, feature_columns = _prepare_frames(pre, seed)
 
@@ -570,7 +581,7 @@ def run() -> int:
         },
         "artifacts": {"modelDir": str(artifact_dir), "checkpoint": str(best_ckpt), "trainingContext": str(context_path)},
         "provenance": {"baseModel": BASE_MODEL, "baseModelRevision": base_revision, "baseModelSha256": base_model_sha256, "baseModelSource": base_source, "baseMatchesPinned": base_matches_pinned, "tabiclVersion": TABICL_VERSION, "fineTunedCheckpointSha256": checkpoint_sha256, "trainingContextSha256": training_context_sha256, "artifactDigestSha256": hashlib.sha256((checkpoint_sha256 + training_context_sha256).encode("utf-8")).hexdigest(), "dataset": _dataset_digest()},
-        "metadata": {"template": TEMPLATE_NAME, "taskType": "tabular_regression", "targetColumn": target, "seed": seed, "epochs": epochs, "learningRate": learning_rate, "evalMetric": eval_metric},
+        "metadata": {"template": TEMPLATE_NAME, "taskType": _resolve_task_type(pipeline_metadata), "targetColumn": target, "seed": seed, "epochs": epochs, "learningRate": learning_rate, "evalMetric": eval_metric},
     }
     write_result(payload)
     log(f"Callback: {json.dumps(notify_done_callback(), sort_keys=True)}")
@@ -581,7 +592,7 @@ def main() -> int:
     try:
         return run()
     except Exception as exc:  # noqa: BLE001
-        payload = {"successful": False, "message": f"TabICLv2 fine-tuning failed: {exc}", "error": {"type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}, "metadata": {"template": TEMPLATE_NAME, "taskType": "tabular_regression"}}
+        payload = {"successful": False, "message": f"TabICLv2 fine-tuning failed: {exc}", "error": {"type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}, "metadata": {"template": TEMPLATE_NAME, "taskType": _resolve_task_type({})}}
         try:
             write_result(payload)
             notify_done_callback()

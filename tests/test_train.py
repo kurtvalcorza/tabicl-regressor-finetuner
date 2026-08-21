@@ -183,3 +183,12 @@ def test_normalize_device_string_honors_dimer_assignment():
     for bad in ("cpu", "mps", "gpu"):
         with pytest.raises(RuntimeError, match="not supported"):
             train._normalize_device_string(bad)
+
+
+def test_resolve_task_type_chain(monkeypatch):
+    # taskType precedence: DIMER metadata -> baked DIMER_TASK_TYPE env -> literal.
+    monkeypatch.delenv("DIMER_TASK_TYPE", raising=False)
+    assert train._resolve_task_type({}) == "tabular_regression"
+    monkeypatch.setenv("DIMER_TASK_TYPE", "baked_custom")
+    assert train._resolve_task_type({}) == "baked_custom"
+    assert train._resolve_task_type({"taskType": "from_metadata"}) == "from_metadata"
