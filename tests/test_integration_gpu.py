@@ -41,7 +41,8 @@ def test_finetune_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(train, "RESULT_PATH", res)
     monkeypatch.setenv("DIMER_HYPERPARAMETERS_JSON", '{"epochs":1,"time_limit_seconds":300,"seed":0}')
 
-    assert train.run() == 0
+    # main(), not run(), owns result persistence and process exit semantics.
+    assert train.main() == 0
     payload = json.loads(res.read_text())
     assert payload["successful"] is True
     assert payload["provenance"]["baseModelRevision"]
