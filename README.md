@@ -10,7 +10,8 @@ for the model's provenance, checksums, and licence.
 - Runs as a **CUDA GPU** Kubernetes Job — GPU-only, no zero-shot fallback (see below).
 - DIMER builds the root `Dockerfile` into an image and runs `train.py`.
 - `dimer-pipeline.json` at the repo root defines the workbench preprocessing and fine-tuning
-  fields. The finetuner build re-reads it on every build.
+  fields. DIMER reads it from the repo root to render them; it is **not** copied into the image,
+  and manifest↔runtime parity is enforced by the test suite (CI), not by the build.
 - Pairs with `tabicl-regressor-dataset-validator`.
 
 ## Fine-tuning is GPU-only
