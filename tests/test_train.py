@@ -192,3 +192,38 @@ def test_resolve_task_type_chain(monkeypatch):
     monkeypatch.setenv("DIMER_TASK_TYPE", "baked_custom")
     assert train._resolve_task_type({}) == "baked_custom"
     assert train._resolve_task_type({"taskType": "from_metadata"}) == "from_metadata"
+
+
+def test_data_relative_is_relative_to_data(monkeypatch):
+    # DIMER resolves artifacts by a /data-relative path; OUTPUT_DIR is two levels below /data.
+    monkeypatch.setattr(train, "OUTPUT_DIR", Path("/data/fine-tuning/run123"))
+    p = Path("/data/fine-tuning/run123/tabicl_regressor/checkpoints/best.ckpt")
+    assert train._data_relative(p) == "fine-tuning/run123/tabicl_regressor/checkpoints/best.ckpt"
+
+
+def test_crash_payload_populates_base_model_and_error():
+    try:
+        raise ValueError("boom")
+    except ValueError as exc:
+        payload = train._crash_payload(exc)
+    assert payload["successful"] is False
+    assert payload["metadata"]["baseModel"] == train.BASE_MODEL
+    assert payload["metadata"]["selectedModelId"] == train.BASE_MODEL
+    assert payload["error"]["type"] == "ValueError"
+    assert "boom" in payload["error"]["message"]
+    assert payload["error"]["traceback"]
+
+
+def test_main_fires_callback_even_when_write_result_fails(monkeypatch):
+    # H1: a write_result failure must NOT skip DIMER_DONE_CALLBACK (else the run
+    # hangs for the full fine-tuning timeout).
+    monkeypatch.setenv("DIMER_MAX_SINGLE_CSV_BYTES", "not-an-int")  # forces run() to raise early
+
+    def _boom(_payload):
+        raise OSError("read-only mount")
+
+    calls: list[bool] = []
+    monkeypatch.setattr(train, "write_result", _boom)
+    monkeypatch.setattr(train, "notify_done_callback", lambda: calls.append(True) or {"attempted": True})
+    assert train.main() == 1
+    assert calls == [True]

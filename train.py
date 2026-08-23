@@ -6,6 +6,7 @@ import json
 import math
 import os
 import sys
+import time
 import traceback
 import zipfile
 from pathlib import Path
@@ -153,6 +154,83 @@ def notify_done_callback() -> dict[str, Any]:
         return {"attempted": True, "ok": response.ok, "statusCode": response.status_code}
     except requests.RequestException as exc:
         return {"attempted": True, "ok": False, "error": str(exc)}
+
+
+def _data_relative(path: Path) -> str:
+    """Path relative to the /data mount root, forward-slashed.
+
+    DIMER_OUTPUT_DIR is always two levels below /data (``/data/fine-tuning/<run_id>``),
+    so the artifact path the backend expects is ``fine-tuning/<run_id>/...``. The
+    backend resolves every result artifact by this /data-relative path
+    (``workbench.domain._resolve_result_artifact``); an absolute path is mis-keyed,
+    so always emit the relative form.
+    """
+    root = OUTPUT_DIR.parent.parent
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _artifact_entry(path: Path, name: str, content_type: str) -> dict[str, Any]:
+    return {
+        "path": _data_relative(path),
+        "name": name,
+        "contentType": content_type,
+        "sizeBytes": path.stat().st_size,
+    }
+
+
+def _emit_progress(epoch_ckpts: list[Path], total_epochs: int, final_metrics: dict[str, Any] | None, start_time: float) -> None:
+    """Best-effort per-epoch progress telemetry for the DIMER progress endpoint.
+
+    TabICL's ``fit()`` is a single blocking call with no per-epoch Python hook, so
+    these files are derived post-fit from the per-epoch checkpoints it leaves on
+    disk (``epoch*.ckpt``); ``elapsedSeconds`` comes from each checkpoint's mtime.
+    That means the progress endpoint is populated once the run finishes, not live
+    during training — live telemetry would need a training callback TabICL does not
+    currently expose. The caller wraps this so it can never fail the run.
+    """
+    progress_dir = OUTPUT_DIR / "progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    completed = len(epoch_ckpts)
+    for idx, ckpt in enumerate(epoch_ckpts, start=1):
+        record: dict[str, Any] = {
+            "epoch": idx,
+            "totalEpochs": int(total_epochs),
+            "elapsedSeconds": round(max(0.0, ckpt.stat().st_mtime - start_time), 3),
+        }
+        if idx == completed and final_metrics:
+            record["metrics"] = final_metrics
+        (progress_dir / f"epoch_{idx:04d}.json").write_text(
+            json.dumps(record, default=str) + "\n", encoding="utf-8"
+        )
+
+
+def _crash_payload(exc: BaseException | None = None) -> dict[str, Any]:
+    """A valid failure envelope, prepared up front so the finally in main() can
+    always persist a result AND fire the callback even if run() never returned.
+    Keeps ``metadata.baseModel``/``selectedModelId`` populated so a failed run does
+    not read as if base-model resolution broke."""
+    payload: dict[str, Any] = {
+        "successful": False,
+        "message": "TabICLv2 fine-tuning did not complete."
+        if exc is None
+        else f"TabICLv2 fine-tuning failed: {exc}",
+        "metadata": {
+            "template": TEMPLATE_NAME,
+            "taskType": _resolve_task_type({}),
+            "baseModel": BASE_MODEL,
+            "selectedModelId": BASE_MODEL,
+        },
+    }
+    if exc is not None:
+        payload["error"] = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+    return payload
 
 
 def _normalize_member(name: str) -> str | None:
@@ -420,7 +498,7 @@ def _resolve_base_model() -> tuple[Path, str, str, bool, str | None]:
     return path, sha256, source, matches_pinned, revision
 
 
-def run() -> int:
+def run() -> dict[str, Any]:
     _load_limits()
     hp = _json_env("DIMER_HYPERPARAMETERS_JSON")
     pre = _json_env("DIMER_PREPROCESSING_ARGS_JSON")
@@ -485,6 +563,7 @@ def run() -> int:
         random_state=seed,
         verbose=True,
     )
+    train_start = time.time()
     model.fit(X_train, y_train, X_val=X_val, y_val=y_val, output_dir=str(ckpt_dir))
 
     best_ckpt = ckpt_dir / "best.ckpt"
@@ -560,13 +639,78 @@ def run() -> int:
         smoke_X = _apply_categorical_encoder(val_raw, inference.get("categoricalEncoders", {}))
         _ = reloaded.predict(smoke_X[served["featureColumns"]].iloc[:smoke_rows])
 
+    # Per-epoch progress telemetry (best-effort) BEFORE pruning the epoch
+    # checkpoints TabICL leaves on disk. See _emit_progress: this is post-fit,
+    # not live, and must never fail the run.
+    epoch_ckpts = sorted(ckpt_dir.glob("epoch*.ckpt"))
+    try:
+        _emit_progress(epoch_ckpts, epochs, val_metrics, train_start)
+    except Exception as exc:  # noqa: BLE001 - telemetry must never fail a run
+        log(f"Progress telemetry skipped: {exc}")
+
     # Keep only best.ckpt in the served artifact; drop intermediate epoch checkpoints.
     pruned_bytes = 0
-    for stale in sorted(ckpt_dir.glob("epoch*.ckpt")):
+    for stale in epoch_ckpts:
         pruned_bytes += stale.stat().st_size
         stale.unlink()
     if pruned_bytes:
         log(f"Pruned {pruned_bytes} bytes of intermediate epoch checkpoints")
+
+    # Side artifacts the DIMER contract resolves from result.json["artifacts"].
+    eval_dir = artifact_dir / "evaluation"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    eval_report_path = eval_dir / "report.json"
+    eval_report_path.write_text(
+        json.dumps(
+            {
+                "val": val_metrics,
+                "test": test_metrics,
+                "evalMetric": eval_metric,
+                "trainRows": int(len(train)),
+                "featureCount": len(feature_columns),
+            },
+            indent=2,
+            default=str,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    logs_dir = artifact_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    run_summary_path = logs_dir / "run-summary.json"
+    run_summary_path.write_text(
+        json.dumps(
+            {
+                "template": TEMPLATE_NAME,
+                "sessionId": os.getenv("DIMER_SESSION_ID"),
+                "runId": os.getenv("DIMER_RUN_ID"),
+                "device": device,
+                "epochs": epochs,
+                "epochsCompleted": len(epoch_ckpts),
+                "baseModel": BASE_MODEL,
+                "baseModelRevision": base_revision,
+                "baseModelSource": base_source,
+                "tabiclVersion": TABICL_VERSION,
+            },
+            indent=2,
+            default=str,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # export-to-repository, model-download, and artifact-info all resolve files by
+    # the /data-relative path in these entries (workbench.domain._resolve_result_artifact).
+    # `modelArtifact` is MANDATORY — without it export reports "No model artifact found".
+    # `trainingContext` is the second file the in-context learner needs at serve time.
+    artifacts = {
+        "modelArtifact": _artifact_entry(best_ckpt, "best.ckpt", "application/octet-stream"),
+        "trainingContext": _artifact_entry(context_path, "training_context.parquet", "application/octet-stream"),
+        "manifest": _artifact_entry(artifact_dir / "artifact.json", "artifact.json", "application/json"),
+        "evaluationReport": _artifact_entry(eval_report_path, "report.json", "application/json"),
+        "logArtifact": _artifact_entry(run_summary_path, "run-summary.json", "application/json"),
+    }
 
     payload = {
         "successful": True,
@@ -579,26 +723,35 @@ def run() -> int:
             "device": device,
             "mode": "fine-tune",
         },
-        "artifacts": {"modelDir": str(artifact_dir), "checkpoint": str(best_ckpt), "trainingContext": str(context_path)},
+        "artifacts": artifacts,
         "provenance": {"baseModel": BASE_MODEL, "baseModelRevision": base_revision, "baseModelSha256": base_model_sha256, "baseModelSource": base_source, "baseMatchesPinned": base_matches_pinned, "tabiclVersion": TABICL_VERSION, "fineTunedCheckpointSha256": checkpoint_sha256, "trainingContextSha256": training_context_sha256, "artifactDigestSha256": hashlib.sha256((checkpoint_sha256 + training_context_sha256).encode("utf-8")).hexdigest(), "dataset": _dataset_digest()},
-        "metadata": {"template": TEMPLATE_NAME, "taskType": _resolve_task_type(pipeline_metadata), "targetColumn": target, "seed": seed, "epochs": epochs, "learningRate": learning_rate, "evalMetric": eval_metric},
+        "metadata": {"template": TEMPLATE_NAME, "taskType": _resolve_task_type(pipeline_metadata), "targetColumn": target, "seed": seed, "epochs": epochs, "learningRate": learning_rate, "evalMetric": eval_metric, "baseModel": BASE_MODEL, "selectedModelId": BASE_MODEL},
     }
-    write_result(payload)
-    log(f"Callback: {json.dumps(notify_done_callback(), sort_keys=True)}")
-    return 0
+    return payload
 
 
 def main() -> int:
+    # Prepare a valid crash envelope up front so the finally can always persist a
+    # result AND always fire DIMER_DONE_CALLBACK — a write_result failure must not
+    # skip the callback (else the run hangs for the full fine-tuning timeout).
+    payload = _crash_payload()
+    rc = 1
     try:
-        return run()
+        payload = run()
+        rc = 0 if payload.get("successful") else 1
     except Exception as exc:  # noqa: BLE001
-        payload = {"successful": False, "message": f"TabICLv2 fine-tuning failed: {exc}", "error": {"type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}, "metadata": {"template": TEMPLATE_NAME, "taskType": _resolve_task_type({})}}
+        payload = _crash_payload(exc)
+        rc = 1
+    finally:
         try:
             write_result(payload)
-            notify_done_callback()
         except Exception as write_exc:  # noqa: BLE001
-            log(f"Failed to persist crash result: {write_exc}")
-        return 1
+            log(f"Failed to persist result: {write_exc}")
+        try:
+            log(f"Callback: {json.dumps(notify_done_callback(), sort_keys=True)}")
+        except Exception as cb_exc:  # noqa: BLE001
+            log(f"Callback failed: {cb_exc}")
+    return rc
 
 
 if __name__ == "__main__":
