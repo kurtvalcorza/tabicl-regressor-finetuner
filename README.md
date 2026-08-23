@@ -2,7 +2,19 @@
 
 DIMER GPU fine-tuner for TabICLv2 regression using `tabicl.FinetunedTabICLRegressor`.
 
-The artifact contains the fine-tuned checkpoint plus the training/support context required for TabICL inference. Validation and optional test metrics are written to `result.json` with provenance hashes.
+The served artifact contains the fine-tuned checkpoint (`best.ckpt`) plus the
+training/support context (`training_context.parquet`) required for TabICL
+inference, described by a self-contained `artifact.json`. Validation and optional
+test metrics are written to `result.json` with provenance hashes, alongside
+`evaluation/report.json`, `logs/run-summary.json`, and best-effort post-fit
+`progress/epoch_*.json`.
+
+`result.json` also emits the DIMER export contract under `result.json["artifacts"]`:
+`modelArtifact` (`best.ckpt`) is **mandatory** for export-to-repository /
+model-download, with `trainingContext` as the second file the in-context learner
+needs at serve time (`manifest`, `evaluationReport`, `logArtifact` alongside).
+Every artifact path is `/data`-relative, which is how the backend resolves it
+(`workbench.domain._resolve_result_artifact`).
 
 Pairs with `tabicl-regressor-dataset-validator`. Full documentation lives in `tabicl-regressor-pipeline`.
 
