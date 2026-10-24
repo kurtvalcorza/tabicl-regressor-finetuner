@@ -18,7 +18,7 @@ RUN python -c "import shutil; from huggingface_hub import hf_hub_download; shuti
 ENV DIMER_TASK_TYPE=tabular_regression \
     TABICL_BAKED_BASE_MODEL=/app/tabicl-regressor-v2-20260212.ckpt \
     DIMER_BASE_MODEL_REVISION=4dcd344ece2c00be9e831fdd35bed57b5ad83e19
-COPY train.py dimer_transport.py dimer_entrypoint.py ./
+COPY train.py dimer_transport.py dimer_entrypoint.py tabicl_safetensors_shim.py ./
 # Non-burst execution delegates directly to train.main(). In GPU_BURST_MODE the
 # wrapper stages MinIO/S3 input into /dev/shm and publishes the full model bundle
 # before result.json and the completion callback.

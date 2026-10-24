@@ -34,7 +34,7 @@ Other key behavior:
   training to `max_train_rows`.
 - best-checkpoint selection on `eval_metric` (`mae` / `mse` / `r2`); reports MAE, MSE, RMSE, R².
 - scores `test.csv` when present, after selection (never used for selection).
-- reloads the fine-tuned checkpoint from `artifact.json` + the context table and predicts before
+- reloads the fine-tuned `best.safetensors` from `artifact.json` + the context table (through the vendored shim, `torch.load` refused) and predicts before
   reporting success.
 
 ## Outputs
@@ -42,7 +42,9 @@ Other key behavior:
 `train.py` materializes the DIMER fine-tuner artifact layout under
 `DIMER_OUTPUT_DIR/tabicl_regressor/`:
 
-- `checkpoints/best.ckpt` — the fine-tuned TabICLv2 checkpoint (the `modelArtifact` DIMER exports).
+- `checkpoints/best.safetensors` — the fine-tuned TabICLv2 weights (the `modelArtifact` DIMER exports; bundle format
+  `tabicl-dimer-regressor-v2`). tabicl writes `best.ckpt` with `torch.save`; it is converted right after training
+  (`torch.load(weights_only=True)`, `config` + `state_dict` only) and no `.ckpt` is packaged. See `DIMER_CONTRACT.md`.
 - `training_context.parquet` — the in-context support table; the **second file** required to serve
   the model.
 - `artifact.json` — the self-contained inference contract (schema, inference block, categorical
@@ -53,7 +55,7 @@ Other key behavior:
   exposes no per-epoch hook).
 
 `result.json` carries the metrics and `provenance`, plus an `artifacts` object with `modelArtifact`
-(`best.ckpt`), `trainingContext` (`training_context.parquet`), `manifest`, `evaluationReport`, and
+(`best.safetensors`, with its `sha256`), `trainingContext` (`training_context.parquet`), `manifest`, `evaluationReport`, and
 `logArtifact` entries — each `{path, name, contentType, sizeBytes}`, `path` relative to the `/data`
 mount (`fine-tuning/<run_id>/...`), which is how the backend resolves it
 (`workbench.domain._resolve_result_artifact`). `modelArtifact` is **mandatory** — without it
