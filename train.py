@@ -9,6 +9,7 @@ import sys
 import time
 import traceback
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -18,6 +19,10 @@ import pandas as pd
 import requests
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
+
+# Vendored byte for byte from kurtvalcorza/tabicl-regressor-pipeline (src/tabicl_regressor_pipeline/safetensors_shim.py);
+# tests/test_vendored_shim.py pins its SHA-256. Do not edit it here: re-sync it from the pipeline repository.
+import tabicl_safetensors_shim as shim
 
 TEMPLATE_NAME = "tabicl-regressor-finetuner"
 BASE_MODEL = "tabicl-regressor-v2-20260212.ckpt"
@@ -172,13 +177,16 @@ def _data_relative(path: Path) -> str:
         return path.as_posix()
 
 
-def _artifact_entry(path: Path, name: str, content_type: str) -> dict[str, Any]:
-    return {
+def _artifact_entry(path: Path, name: str, content_type: str, sha256: str | None = None) -> dict[str, Any]:
+    entry = {
         "path": _data_relative(path),
         "name": name,
         "contentType": content_type,
         "sizeBytes": path.stat().st_size,
     }
+    if sha256 is not None:
+        entry["sha256"] = sha256
+    return entry
 
 
 def _emit_progress(epoch_ckpts: list[Path], total_epochs: int, final_metrics: dict[str, Any] | None, start_time: float) -> None:
@@ -436,6 +444,71 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _convert_best_checkpoint(ckpt_dir: Path) -> tuple[Path, dict[str, Any]]:
+    """Replace tabicl's pickle ``best.ckpt`` with ``best.safetensors``; delete every ``.ckpt``.
+
+    tabicl 2.1.1's fine-tuning loop writes ``best.ckpt`` and ``epoch{N}.ckpt`` itself with ``torch.save``. Right after
+    training, ``best.ckpt`` is read once with ``torch.load(weights_only=True)`` (``shim.convert_finetuned_checkpoint``):
+    only ``config`` and ``state_dict`` are kept, as safetensors with the config as sorted JSON metadata. No pickle is
+    packaged (bundle format ``{shim.ARTIFACT_FORMAT}``)."""
+    best = ckpt_dir / "best.ckpt"
+    if not best.exists():
+        raise RuntimeError("TabICL fine-tuning completed without producing checkpoints/best.ckpt")
+    facts = shim.convert_finetuned_checkpoint(best, ckpt_dir / "best.safetensors")
+    removed = 0
+    for stale in sorted(ckpt_dir.glob("*.ckpt")):
+        removed += stale.stat().st_size
+        stale.unlink()
+    left = sorted(p.name for p in ckpt_dir.parent.rglob("*.ckpt"))
+    if left:
+        raise RuntimeError(f"pickle checkpoints left in the bundle: {left}")
+    return Path(facts["path"]), {**facts, "removed_pickle_bytes": removed}
+
+
+@contextmanager
+def _torch_load_refused():
+    """Make ``torch.load`` raise while the safetensors bundle is rebuilt, so the smoke test proves no pickle is read."""
+    import torch
+
+    real = torch.load
+
+    def refuse(*args: Any, **kwargs: Any):
+        raise RuntimeError("torch.load called while serving the safetensors bundle")
+
+    torch.load = refuse
+    try:
+        yield
+    finally:
+        torch.load = real
+
+
+def _reload_bundle(artifact_dir: Path, device: str, rows: pd.DataFrame | None):
+    """Rebuild the served model from ``artifact.json`` plus its referenced files only, through the vendored shim with
+    ``torch.load`` refused, then predict ``rows``. Returns the predictions (None without rows)."""
+    served = json.loads((artifact_dir / "artifact.json").read_text(encoding="utf-8"))
+    shim.check_bundle_layout(served)
+    inference = served["inference"]
+    model_path = artifact_dir / inference["modelPath"]
+    if _sha256(model_path) != served["digests"]["checkpointSha256"]:
+        raise RuntimeError("checkpoint digest mismatch in the bundle just written")
+    context = pd.read_parquet(artifact_dir / served["trainingContext"])
+    with _torch_load_refused():
+        reloaded = shim.serving_regressor_class(model_path)(
+            model_path=str(model_path),
+            allow_auto_download=inference["allowAutoDownload"],
+            n_estimators=inference["nEstimators"],
+            random_state=inference["randomState"],
+            # Run the training-time smoke on the DIMER-assigned GPU, not the artifact's
+            # portable serving default (inference["device"] == "cuda").
+            device=device,
+            **({"support_many_classes": inference["supportManyClasses"]} if "supportManyClasses" in inference else {}),
+        )
+        reloaded.fit(context[served["featureColumns"]], context[served["targetColumn"]])
+        if rows is None or not len(rows):
+            return None
+        return reloaded.predict(rows[served["featureColumns"]])
+
+
 def _dataset_digest() -> dict[str, Any] | None:
     zips = sorted(DATASET_DIR.glob("*.zip"))
     if zips:
@@ -520,7 +593,7 @@ def run() -> dict[str, Any]:
 
     device = _resolve_train_device()
 
-    from tabicl import FinetunedTabICLRegressor, TabICLRegressor
+    from tabicl import FinetunedTabICLRegressor
 
     base_ckpt, base_model_sha256, base_source, base_matches_pinned, base_revision = _resolve_base_model()
     if base_source == "dimer-provided" and not base_matches_pinned:
@@ -573,72 +646,6 @@ def run() -> dict[str, Any]:
     val_metrics = _regression_metrics(model, val, target)
     test_metrics = _regression_metrics(model, test, target) if test is not None and len(test) else None
 
-    # Build a portable inference artifact: fine-tuned checkpoint + the ICL context table.
-    context_path = artifact_dir / "training_context.parquet"
-    train.to_parquet(context_path, index=False)
-    checkpoint_sha256 = _sha256(best_ckpt)
-    training_context_sha256 = _sha256(context_path)
-    # artifact.json is the complete inference contract: everything a serving
-    # process needs to rebuild the exact model that produced the reported metrics.
-    manifest = {
-        "artifactFormat": "tabicl-dimer-regressor-v1",
-        "checkpoint": "checkpoints/best.ckpt",
-        "trainingContext": "training_context.parquet",
-        "targetColumn": target,
-        "featureColumns": feature_columns,
-        "baseCheckpoint": BASE_MODEL,
-        "baseModelRevision": base_revision,
-        "baseModelSha256": base_model_sha256,
-        "baseModelSource": base_source,
-        "baseMatchesPinned": base_matches_pinned,
-        "tabiclVersion": TABICL_VERSION,
-        "inference": {
-            "class": "TabICLRegressor",
-            "modelPath": "checkpoints/best.ckpt",
-            "nEstimators": n_inf,
-            "randomState": seed,
-            # Portable serving default (the serving node picks its own GPU); the
-            # DIMER-assigned training device is recorded under result.json metrics.
-            "device": "cuda",
-            "allowAutoDownload": False,
-            "categoricalEncoders": categorical_encoders,
-            "encoding": "ordinal; code = index in categoricalEncoders[col]; missing/unseen = len(list)",
-            "procedure": (
-                "TabICLRegressor(model_path, **inference); "
-                "apply categoricalEncoders to X; "
-                "fit(context[featureColumns], context[targetColumn]); "
-                "predict(X[featureColumns])"
-            ),
-        },
-        "digests": {
-            "checkpointSha256": checkpoint_sha256,
-            "trainingContextSha256": training_context_sha256,
-        },
-    }
-    (artifact_dir / "artifact.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-
-    # Prove the artifact is a self-contained inference contract: reconstruct the
-    # model using ONLY artifact.json + the context table, then predict.
-    served = json.loads((artifact_dir / "artifact.json").read_text(encoding="utf-8"))
-    inference = served["inference"]
-    context = pd.read_parquet(artifact_dir / served["trainingContext"])
-    ctx_features = context[served["featureColumns"]]
-    ctx_target = context[served["targetColumn"]]
-    reloaded = TabICLRegressor(
-        model_path=str(artifact_dir / inference["modelPath"]),
-        allow_auto_download=inference["allowAutoDownload"],
-        n_estimators=inference["nEstimators"],
-        random_state=inference["randomState"],
-        # Run the training-time smoke on the DIMER-assigned GPU, not the artifact's
-        # portable serving default (inference["device"] == "cuda").
-        device=device,
-    )
-    reloaded.fit(ctx_features, ctx_target)
-    smoke_rows = min(8, len(val_raw))
-    if smoke_rows:
-        smoke_X = _apply_categorical_encoder(val_raw, inference.get("categoricalEncoders", {}))
-        _ = reloaded.predict(smoke_X[served["featureColumns"]].iloc[:smoke_rows])
-
     # Per-epoch progress telemetry (best-effort) BEFORE pruning the epoch
     # checkpoints TabICL leaves on disk. See _emit_progress: this is post-fit,
     # not live, and must never fail the run.
@@ -648,13 +655,11 @@ def run() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - telemetry must never fail a run
         log(f"Progress telemetry skipped: {exc}")
 
-    # Keep only best.ckpt in the served artifact; drop intermediate epoch checkpoints.
-    pruned_bytes = 0
-    for stale in epoch_ckpts:
-        pruned_bytes += stale.stat().st_size
-        stale.unlink()
-    if pruned_bytes:
-        log(f"Pruned {pruned_bytes} bytes of intermediate epoch checkpoints")
+    # tabicl wrote best.ckpt (and epoch*.ckpt) itself with torch.save: convert best.ckpt once with
+    # torch.load(weights_only=True) and delete every .ckpt, so only best.safetensors is packaged (bundle v2).
+    best_path, best_facts = _convert_best_checkpoint(ckpt_dir)
+    if best_facts["removed_pickle_bytes"]:
+        log(f"Converted best.ckpt to {best_path.name}; removed {best_facts['removed_pickle_bytes']} bytes of pickle checkpoints")
 
     # Side artifacts the DIMER contract resolves from result.json["artifacts"].
     eval_dir = artifact_dir / "evaluation"
@@ -700,12 +705,68 @@ def run() -> dict[str, Any]:
         encoding="utf-8",
     )
 
+    # Build a portable inference artifact: fine-tuned checkpoint + the ICL context table.
+    context_path = artifact_dir / "training_context.parquet"
+    train.to_parquet(context_path, index=False)
+    checkpoint_sha256 = best_facts["converted_sha256"]
+    training_context_sha256 = _sha256(context_path)
+    payload_files = sorted(
+        f.relative_to(artifact_dir).as_posix() for f in artifact_dir.rglob("*") if f.is_file() and f.name != "artifact.json"
+    )
+    # artifact.json is the complete inference contract: everything a serving
+    # process needs to rebuild the exact model that produced the reported metrics.
+    manifest = {
+        "artifactFormat": shim.ARTIFACT_FORMAT,
+        "checkpoint": shim.BUNDLE_CHECKPOINT,
+        "trainingContext": "training_context.parquet",
+        "targetColumn": target,
+        "featureColumns": feature_columns,
+        "baseCheckpoint": BASE_MODEL,
+        "baseModelRevision": base_revision,
+        "baseModelSha256": base_model_sha256,
+        "baseModelSource": base_source,
+        "baseMatchesPinned": base_matches_pinned,
+        "tabiclVersion": TABICL_VERSION,
+        "inference": {
+            "class": "TabICLRegressor",
+            "modelPath": shim.BUNDLE_CHECKPOINT,
+            "weightsFormat": "safetensors (config in the string metadata; load with tabicl_safetensors_shim.serving_regressor_class)",
+            "nEstimators": n_inf,
+            "randomState": seed,
+            # Portable serving default (the serving node picks its own GPU); the
+            # DIMER-assigned training device is recorded under result.json metrics.
+            "device": "cuda",
+            "allowAutoDownload": False,
+            "categoricalEncoders": categorical_encoders,
+            "encoding": "ordinal; code = index in categoricalEncoders[col]; missing/unseen = len(list)",
+            "procedure": (
+                "tabicl_safetensors_shim.serving_regressor_class(modelPath)(model_path, **inference), no torch.load; "
+                "apply categoricalEncoders to X; "
+                "fit(context[featureColumns], context[targetColumn]); "
+                "predict(X[featureColumns])"
+            ),
+        },
+        "sizes": {"checkpoint": best_path.stat().st_size, "trainingContext": context_path.stat().st_size},
+        "payloadFiles": payload_files,
+        "digests": {
+            "checkpointSha256": checkpoint_sha256,
+            "trainingContextSha256": training_context_sha256,
+        },
+    }
+    (artifact_dir / "artifact.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    # Prove the artifact is a self-contained inference contract: reconstruct the model using ONLY artifact.json +
+    # its files, through the vendored safetensors shim with torch.load refused, then predict.
+    smoke_rows = min(8, len(val_raw))
+    smoke_X = _apply_categorical_encoder(val_raw, categorical_encoders).iloc[:smoke_rows] if smoke_rows else None
+    _reload_bundle(artifact_dir, device, smoke_X)
+
     # export-to-repository, model-download, and artifact-info all resolve files by
     # the /data-relative path in these entries (workbench.domain._resolve_result_artifact).
     # `modelArtifact` is MANDATORY — without it export reports "No model artifact found".
     # `trainingContext` is the second file the in-context learner needs at serve time.
     artifacts = {
-        "modelArtifact": _artifact_entry(best_ckpt, "best.ckpt", "application/octet-stream"),
+        "modelArtifact": _artifact_entry(best_path, best_path.name, "application/octet-stream", checkpoint_sha256),
         "trainingContext": _artifact_entry(context_path, "training_context.parquet", "application/octet-stream"),
         "manifest": _artifact_entry(artifact_dir / "artifact.json", "artifact.json", "application/json"),
         "evaluationReport": _artifact_entry(eval_report_path, "report.json", "application/json"),
@@ -724,7 +785,7 @@ def run() -> dict[str, Any]:
             "mode": "fine-tune",
         },
         "artifacts": artifacts,
-        "provenance": {"baseModel": BASE_MODEL, "baseModelRevision": base_revision, "baseModelSha256": base_model_sha256, "baseModelSource": base_source, "baseMatchesPinned": base_matches_pinned, "tabiclVersion": TABICL_VERSION, "fineTunedCheckpointSha256": checkpoint_sha256, "trainingContextSha256": training_context_sha256, "artifactDigestSha256": hashlib.sha256((checkpoint_sha256 + training_context_sha256).encode("utf-8")).hexdigest(), "dataset": _dataset_digest()},
+        "provenance": {"baseModel": BASE_MODEL, "baseModelRevision": base_revision, "baseModelSha256": base_model_sha256, "baseModelSource": base_source, "baseMatchesPinned": base_matches_pinned, "tabiclVersion": TABICL_VERSION, "fineTunedCheckpointSha256": checkpoint_sha256, "fineTunedCheckpointFormat": "safetensors", "fineTunedPickleSha256": best_facts["source_sha256"], "trainingContextSha256": training_context_sha256, "artifactDigestSha256": hashlib.sha256((checkpoint_sha256 + training_context_sha256).encode("utf-8")).hexdigest(), "dataset": _dataset_digest()},
         "metadata": {"template": TEMPLATE_NAME, "taskType": _resolve_task_type(pipeline_metadata), "targetColumn": target, "seed": seed, "epochs": epochs, "learningRate": learning_rate, "evalMetric": eval_metric, "baseModel": BASE_MODEL, "selectedModelId": BASE_MODEL},
     }
     return payload

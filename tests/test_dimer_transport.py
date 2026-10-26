@@ -82,7 +82,7 @@ def test_success_bundle_uploads_result_last(tmp_path, monkeypatch):
     root = tmp_path
     dataset_dir = root / "dataset"
     output_dir = root / "fine-tuning" / "r1"
-    artifact = output_dir / "tabicl_regressor" / "checkpoints" / "best.ckpt"
+    artifact = output_dir / "tabicl_regressor" / "checkpoints" / "best.safetensors"
     context = output_dir / "tabicl_regressor" / "training_context.parquet"
     manifest = output_dir / "tabicl_regressor" / "artifact.json"
     result = output_dir / "result.json"
@@ -105,7 +105,7 @@ def test_success_bundle_uploads_result_last(tmp_path, monkeypatch):
     payload = {
         "successful": True,
         "artifacts": {
-            "modelArtifact": descriptor(artifact, "best.ckpt"),
+            "modelArtifact": descriptor(artifact, "best.safetensors"),
             "trainingContext": descriptor(context, "training_context.parquet"),
             "manifest": descriptor(manifest, "artifact.json"),
         },
@@ -120,7 +120,7 @@ def test_success_bundle_uploads_result_last(tmp_path, monkeypatch):
 
     uploaded_keys = [key for _source, _bucket, key in fake.uploads]
     assert uploaded_keys[-1] == "workbench/sessions/s1/fine-tuning/r1/result.json"
-    assert "workbench/sessions/s1/fine-tuning/r1/tabicl_regressor/checkpoints/best.ckpt" in uploaded_keys
+    assert "workbench/sessions/s1/fine-tuning/r1/tabicl_regressor/checkpoints/best.safetensors" in uploaded_keys
     assert "workbench/sessions/s1/fine-tuning/r1/tabicl_regressor/training_context.parquet" in uploaded_keys
     assert "workbench/sessions/s1/fine-tuning/r1/tabicl_regressor/artifact.json" in uploaded_keys
     assert "workbench/sessions/s1/fine-tuning/r1/artifacts/best.pt" in uploaded_keys
@@ -141,8 +141,8 @@ def test_declared_missing_artifact_fails_before_result_publish(tmp_path, monkeyp
         "successful": True,
         "artifacts": {
             "modelArtifact": {
-                "path": "fine-tuning/r1/tabicl_regressor/checkpoints/best.ckpt",
-                "name": "best.ckpt",
+                "path": "fine-tuning/r1/tabicl_regressor/checkpoints/best.safetensors",
+                "name": "best.safetensors",
                 "sizeBytes": 1,
             }
         },
